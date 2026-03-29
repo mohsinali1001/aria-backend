@@ -1,19 +1,16 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from typing import Optional
-from database import get_db
-from models import User, Notification, Reminder, EmailSummary
+from database import get_supabase
 from dotenv import load_dotenv
-import uuid
 import os
 
 load_dotenv()
 
 app = FastAPI(
     title="ARIA Backend API",
-    description="AI Personal Secretary Backend",
+    description="AI Personal Secretary — FastAPI Backend with Supabase",
     version="1.0.0"
 )
 
@@ -25,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── Schemas ───────────────────────────────────────────
+# ── Schemas ───────────────────────────────────────────────────────────────
 class UserCreate(BaseModel):
     firebase_uid: str
     email: str
@@ -45,196 +42,375 @@ class ReminderCreate(BaseModel):
     note: Optional[str] = None
     remind_at: str
 
-# ── Health Check ──────────────────────────────────────
+class EmailSummaryCreate(BaseModel):
+    user_id: str
+    from_email: str
+    from_name: Optional[str] = None
+    subject: str
+    body: Optional[str] = None
+    summary: Optional[str] = None
+    priority: Optional[str] = "normal"
+
+# ── Health Check ──────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {"status": "ARIA Backend Running ✅", "version": "1.0.0"}
-
-# ── User Routes ───────────────────────────────────────
-@app.post("/users")
-async def create_or_get_user(
-    payload: UserCreate,
-    db: Session = Depends(get_db)
-):
-    existing = db.query(User).filter(
-        User.firebase_uid == payload.firebase_uid
-    ).first()
-
-    if existing:
-        return {
-            "id": str(existing.id),
-            "firebase_uid": existing.firebase_uid,
-            "email": existing.email,
-            "name": existing.name,
-            "created_at": str(existing.created_at),
-            "existing": True
-        }
-
-    user = User(
-        firebase_uid=payload.firebase_uid,
-        email=payload.email,
-        name=payload.name
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-
     return {
-        "id": str(user.id),
-        "firebase_uid": user.firebase_uid,
-        "email": user.email,
-        "name": user.name,
-        "created_at": str(user.created_at),
-        "existing": False
+        "status": "ARIA Backend Running ✅",
+        "version": "1.0.0",
+        "docs": "/docs"
     }
 
-# ── Notification Routes ───────────────────────────────
-@app.post("/notify")
-async def notify(
-    payload: NotifyPayload,
-    db: Session = Depends(get_db)
-):
-    existing = db.query(Notification).filter(
-        Notification.message_id == payload.message_id
-    ).first()
+# ── User Routes ───────────────────────────────────────────────────────────
+@app.post("/users")
+async def create_or_get_user(payload: UserCreate):
+    try:
+        db = get_supabase()
 
-    if existing:
+        # Check if user already exists
+        existing = db.table("users") \
+            .select("*") \
+            .eq("firebase_uid", payload.firebase_uid) \
+            .execute()
+
+        if existing.data:
+            return {**existing.data[0], "existing": True}
+
+        # Create new user
+        result = db.table("users").insert({
+            "firebase_uid": payload.firebase_uid,
+            "email": payload.email,
+            "name": payload.name
+        }).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create user")
+
+        return {**result.data[0], "existing": False}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/users/{firebase_uid}")
+async def get_user(firebase_uid: str):
+    try:
+        db = get_supabase()
+
+        result = db.table("users") \
+            .select("*") \
+            .eq("firebase_uid", firebase_uid) \
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        return result.data[0]
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Notification Routes ───────────────────────────────────────────────────
+@app.post("/notify")
+async def notify(payload: NotifyPayload):
+    try:
+        db = get_supabase()
+
+        # Check for duplicate message
+        existing = db.table("notifications") \
+            .select("*") \
+            .eq("message_id", payload.message_id) \
+            .execute()
+
+        if existing.data:
+            return {
+                "success": True,
+                "notification_id": existing.data[0]["id"],
+                "duplicate": True
+            }
+
+        # Insert new notification
+        result = db.table("notifications").insert({
+            "from_email": payload.from_email,
+            "subject": payload.subject,
+            "message": payload.message,
+            "category": payload.category,
+            "message_id": payload.message_id,
+            "user_id": payload.user_id,
+            "is_read": False
+        }).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create notification")
+
         return {
             "success": True,
-            "notification_id": str(existing.id),
-            "duplicate": True
+            "notification_id": result.data[0]["id"],
+            "duplicate": False
         }
 
-    notification = Notification(
-        from_email=payload.from_email,
-        subject=payload.subject,
-        message=payload.message,
-        category=payload.category,
-        message_id=payload.message_id
-    )
-    db.add(notification)
-    db.commit()
-    db.refresh(notification)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return {
-        "success": True,
-        "notification_id": str(notification.id)
-    }
 
 @app.get("/notifications")
-async def get_notifications(db: Session = Depends(get_db)):
-    notifications = db.query(Notification)\
-        .order_by(Notification.created_at.desc())\
-        .limit(50)\
-        .all()
+async def get_all_notifications():
+    try:
+        db = get_supabase()
 
-    return {
-        "notifications": [
-            {
-                "id": str(n.id),
-                "from_email": n.from_email,
-                "subject": n.subject,
-                "message": n.message,
-                "category": n.category,
-                "message_id": n.message_id,
-                "is_read": n.is_read,
-                "created_at": str(n.created_at)
-            }
-            for n in notifications
-        ]
-    }
+        result = db.table("notifications") \
+            .select("*") \
+            .order("created_at", desc=True) \
+            .limit(50) \
+            .execute()
+
+        return {
+            "notifications": result.data,
+            "count": len(result.data)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/notifications/{user_id}")
+async def get_user_notifications(user_id: str):
+    try:
+        db = get_supabase()
+
+        result = db.table("notifications") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=True) \
+            .limit(50) \
+            .execute()
+
+        return {
+            "notifications": result.data,
+            "count": len(result.data)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.patch("/notifications/{notification_id}/read")
-async def mark_read(
-    notification_id: str,
-    db: Session = Depends(get_db)
-):
-    notification = db.query(Notification).filter(
-        Notification.id == notification_id
-    ).first()
+async def mark_notification_read(notification_id: str):
+    try:
+        db = get_supabase()
 
-    if not notification:
-        raise HTTPException(status_code=404, detail="Not found")
+        result = db.table("notifications") \
+            .update({"is_read": True}) \
+            .eq("id", notification_id) \
+            .execute()
 
-    notification.is_read = True
-    db.commit()
-    return {"success": True}
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Notification not found")
 
-# ── Reminder Routes ───────────────────────────────────
+        return {"success": True, "id": notification_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/notifications/{notification_id}")
+async def delete_notification(notification_id: str):
+    try:
+        db = get_supabase()
+
+        db.table("notifications") \
+            .delete() \
+            .eq("id", notification_id) \
+            .execute()
+
+        return {"success": True}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Reminder Routes ───────────────────────────────────────────────────────
 @app.post("/reminders")
-async def create_reminder(
-    payload: ReminderCreate,
-    db: Session = Depends(get_db)
-):
-    reminder = Reminder(
-        user_id=payload.user_id,
-        title=payload.title,
-        note=payload.note,
-        remind_at=payload.remind_at
-    )
-    db.add(reminder)
-    db.commit()
-    db.refresh(reminder)
+async def create_reminder(payload: ReminderCreate):
+    try:
+        db = get_supabase()
 
-    return {
-        "id": str(reminder.id),
-        "title": reminder.title,
-        "remind_at": str(reminder.remind_at),
-        "created_at": str(reminder.created_at)
-    }
+        result = db.table("reminders").insert({
+            "user_id": payload.user_id,
+            "title": payload.title,
+            "note": payload.note,
+            "remind_at": payload.remind_at,
+            "is_done": False
+        }).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create reminder")
+
+        return {
+            "success": True,
+            "reminder": result.data[0]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/reminders/{user_id}")
-async def get_reminders(
-    user_id: str,
-    db: Session = Depends(get_db)
-):
-    reminders = db.query(Reminder)\
-        .filter(Reminder.user_id == user_id)\
-        .filter(Reminder.is_done == False)\
-        .order_by(Reminder.remind_at.asc())\
-        .all()
+async def get_reminders(user_id: str):
+    try:
+        db = get_supabase()
 
-    return {
-        "reminders": [
-            {
-                "id": str(r.id),
-                "title": r.title,
-                "note": r.note,
-                "remind_at": str(r.remind_at),
-                "is_done": r.is_done
-            }
-            for r in reminders
-        ]
-    }
+        result = db.table("reminders") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .eq("is_done", False) \
+            .order("remind_at", desc=False) \
+            .execute()
+
+        return {
+            "reminders": result.data,
+            "count": len(result.data)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/reminders/{user_id}/all")
+async def get_all_reminders(user_id: str):
+    try:
+        db = get_supabase()
+
+        result = db.table("reminders") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .order("remind_at", desc=False) \
+            .execute()
+
+        return {
+            "reminders": result.data,
+            "count": len(result.data)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.patch("/reminders/{reminder_id}/done")
-async def reminder_done(
-    reminder_id: str,
-    db: Session = Depends(get_db)
-):
-    reminder = db.query(Reminder).filter(
-        Reminder.id == reminder_id
-    ).first()
+async def mark_reminder_done(reminder_id: str):
+    try:
+        db = get_supabase()
 
-    if not reminder:
-        raise HTTPException(status_code=404, detail="Not found")
+        result = db.table("reminders") \
+            .update({"is_done": True}) \
+            .eq("id", reminder_id) \
+            .execute()
 
-    reminder.is_done = True
-    db.commit()
-    return {"success": True}
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Reminder not found")
+
+        return {"success": True, "id": reminder_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.delete("/reminders/{reminder_id}")
-async def delete_reminder(
-    reminder_id: str,
-    db: Session = Depends(get_db)
-):
-    reminder = db.query(Reminder).filter(
-        Reminder.id == reminder_id
-    ).first()
+async def delete_reminder(reminder_id: str):
+    try:
+        db = get_supabase()
 
-    if not reminder:
-        raise HTTPException(status_code=404, detail="Not found")
+        db.table("reminders") \
+            .delete() \
+            .eq("id", reminder_id) \
+            .execute()
 
-    db.delete(reminder)
-    db.commit()
-    return {"success": True}
+        return {"success": True}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Email Summary Routes ──────────────────────────────────────────────────
+@app.post("/email-summaries")
+async def create_email_summary(payload: EmailSummaryCreate):
+    try:
+        db = get_supabase()
+
+        result = db.table("email_summaries").insert({
+            "user_id": payload.user_id,
+            "from_email": payload.from_email,
+            "from_name": payload.from_name,
+            "subject": payload.subject,
+            "body": payload.body,
+            "summary": payload.summary,
+            "priority": payload.priority,
+            "is_read": False
+        }).execute()
+
+        if not result.data:
+            raise HTTPException(status_code=500, detail="Failed to create email summary")
+
+        return {
+            "success": True,
+            "email_summary": result.data[0]
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/email-summaries/{user_id}")
+async def get_email_summaries(user_id: str):
+    try:
+        db = get_supabase()
+
+        result = db.table("email_summaries") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .order("created_at", desc=True) \
+            .limit(20) \
+            .execute()
+
+        return {
+            "emails": result.data,
+            "count": len(result.data)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/email-summaries/{email_id}/read")
+async def mark_email_read(email_id: str):
+    try:
+        db = get_supabase()
+
+        result = db.table("email_summaries") \
+            .update({"is_read": True}) \
+            .eq("id", email_id) \
+            .execute()
+
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Email summary not found")
+
+        return {"success": True, "id": email_id}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
