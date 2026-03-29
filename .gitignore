@@ -1,0 +1,9 @@
+New-Item .gitignore
+```
+
+Paste:
+```
+.env
+venv/
+__pycache__/
+*.pyc
